@@ -20,7 +20,7 @@
   <header class="topbar"><div class="brand">HOST <span>| CONTROLE DE UNIFORMES</span></div><div class="topbar-note">Gente &amp; Cultura · Gestão interna</div></header>
   <main class="shell">
     <section id="homeView">
-      <div class="page-head"><div><p class="eyebrow">Gestão de pessoas</p><h1>Tamanhos de camisas</h1><p class="sub">Acompanhe o preenchimento dos tamanhos por operação.</p></div><button class="btn" id="exportHome">↓ Exportar CSV</button></div>
+      <div class="page-head"><div><p class="eyebrow">Gestão de pessoas</p><h1>Tamanhos de camisas</h1><p class="sub">Acompanhe o preenchimento dos tamanhos por operação.</p></div><div class="toolbar"><button class="btn" id="importHome">↑ Importar respostas</button><button class="btn" id="exportHome">↓ Exportar CSV</button></div></div>
       <div class="stats">
         <div class="stat"><div class="stat-label">Total de colaboradores</div><div class="stat-value" id="totalCount">—</div></div>
         <div class="stat done"><div class="stat-label">Tamanhos preenchidos</div><div class="stat-value" id="filledCount">—</div></div>
@@ -51,6 +51,17 @@
       <div class="modal-actions"><button type="button" class="btn" id="cancelModal">Cancelar</button><button type="submit" class="btn primary" id="savePerson">Salvar colaborador</button></div>
     </form>
   </div>
+  <div class="modal-backdrop hidden" id="importBackdrop" role="dialog" aria-modal="true" aria-labelledby="importTitle">
+    <div class="modal" style="width:min(760px,100%);max-height:90vh;overflow:auto">
+      <div class="modal-head"><h2 id="importTitle">Importar tamanhos por arquivo</h2><button type="button" class="icon-btn" id="closeImport" aria-label="Fechar">✕</button></div>
+      <p class="sub" style="margin:0 0 16px">Selecione o CSV exportado do formulário. A importação atualiza somente o tamanho de colaboradores já cadastrados; nenhum cadastro será criado ou excluído.</p>
+      <div class="field"><label for="importFile">Arquivo CSV de respostas</label><input id="importFile" type="file" accept=".csv,text/csv"></div>
+      <div id="importSummary" class="sub" style="margin:12px 0"></div>
+      <div id="importDetails" class="table-wrap hidden" style="max-height:300px;overflow:auto;border:1px solid var(--line);border-radius:9px"></div>
+      <p class="status" id="importStatus" aria-live="polite"></p>
+      <div class="modal-actions"><button type="button" class="btn" id="cancelImport">Cancelar</button><button type="button" class="btn primary" id="confirmImport" disabled>Importar tamanhos</button></div>
+    </div>
+  </div>
   <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
 
   <script>
@@ -59,12 +70,14 @@
     const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_uzJFjSII9usSFRELHE2TZg_iOuhzT-9';
     const TABLE = 'uniform_sizes';
     const OPERATIONS = ['CSC','Giz','Hoots','Mézzi','Misaki','Moleska','Sussa'];
-    const SIZES = ['PP','P','M','G','GG','XG','XGG'];
+    const SIZES = ['PP','P','M','G','GG','XG'];
     const db = window.supabase.createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY);
     let people = [];
     let activeOperation = null;
     let editingId = null;
     let toastTimer;
+    let importPlan = [];
+    let importFileName = '';
 
     const $ = id => document.getElementById(id);
     const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -108,11 +121,69 @@
     async function deletePerson(id){const person=people.find(p=>String(p.id)===String(id));if(!person)return;if(!confirm(`Excluir ${person.nome} da lista? Essa ação não pode ser desfeita.`))return;const {error}=await db.from(TABLE).delete().eq('id',id);if(error){notify('Não foi possível excluir: '+error.message,true);return}people=people.filter(p=>String(p.id)!==String(id));renderHome();renderList();notify('Colaborador excluído.')}
     function exportCsv(rows,filename){const header=['Nome','Operação','Tamanho'];const lines=[header,...rows.map(p=>[p.nome,p.operacao,p.tamanho||'PENDENTE'])];const csv='\uFEFF'+lines.map(line=>line.map(v=>'"'+String(v??'').replace(/"/g,'""')+'"').join(';')).join('\r\n');const blob=new Blob([csv],{type:'text/csv;charset=utf-8;'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=filename;a.click();URL.revokeObjectURL(url)}
 
+    // Importação segura: identifica por nome normalizado, nunca por CPF.
+    const normalizeName = value => String(value ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLocaleLowerCase('pt-BR').replace(/[^a-z0-9]+/g,' ').trim().replace(/\s+/g,' ');
+    const IMPORT_ALIASES = new Map([
+      [normalizeName('Virginia carioca fermandes'), normalizeName('VIRGINIA CARIOCA FERNANDES')],
+      [normalizeName('Natália Jordana dos Santos Ribeiro Silva'), normalizeName('NATALIA JORDANA DOS SANTOS RIBEIRO')]
+    ]);
+    const IMPORT_SIZE_OVERRIDES = new Map([
+      [normalizeName('Maria Andressa Tavares da Silva'), 'G'],
+      [normalizeName('Milene Soares Ferreira'), 'P']
+    ]);
+    function parseCsv(text){
+      const first=(text.split(/\r?\n/,1)[0]||'');const delimiter=(first.match(/;/g)||[]).length>(first.match(/,/g)||[]).length?';':',';
+      const rows=[];let row=[],field='',quoted=false;
+      for(let i=0;i<text.length;i++){const c=text[i];if(quoted){if(c==='"'&&text[i+1]==='"'){field+='"';i++}else if(c==='"')quoted=false;else field+=c}else if(c==='"')quoted=true;else if(c===delimiter){row.push(field);field=''}else if(c==='\n'){row.push(field.replace(/\r$/,''));rows.push(row);row=[];field=''}else field+=c}
+      if(field.length||row.length){row.push(field.replace(/\r$/,''));rows.push(row)}return rows;
+    }
+    function openImport(){importPlan=[];importFileName='';$('importFile').value='';$('importSummary').textContent='';$('importDetails').innerHTML='';$('importDetails').classList.add('hidden');$('confirmImport').disabled=true;setStatus('importStatus');$('importBackdrop').classList.remove('hidden')}
+    function closeImport(){ $('importBackdrop').classList.add('hidden'); importPlan=[]; }
+    async function prepareImport(file){
+      if(!file)return;setStatus('importStatus','Lendo arquivo…');$('confirmImport').disabled=true;
+      try{
+        const rows=parseCsv((await file.text()).replace(/^\uFEFF/,''));if(rows.length<2)throw new Error('O arquivo não contém respostas.');
+        const headers=rows[0].map(x=>x.trim());const nameIdx=headers.indexOf('Seu nome completo'),opIdx=headers.indexOf('Sua operação'),sizeIdx=headers.indexOf('Seu tamanho de camisa');
+        if(nameIdx<0||opIdx<0||sizeIdx<0)throw new Error('Não encontrei as três colunas esperadas do formulário.');
+        const grouped=new Map();
+        rows.slice(1).forEach(r=>{const rawName=(r[nameIdx]||'').trim();if(!rawName)return;const key=normalizeName(rawName);const size=(r[sizeIdx]||'').trim().toUpperCase();if(!grouped.has(key))grouped.set(key,{rawName,rows:[],sizes:new Set()});const item=grouped.get(key);item.rows.push({operation:(r[opIdx]||'').trim(),size});if(SIZES.includes(size))item.sizes.add(size)});
+        const peopleByName=new Map();people.forEach(p=>{const key=normalizeName(p.nome);if(!peopleByName.has(key))peopleByName.set(key,[]);peopleByName.get(key).push(p)});
+        const plan=[],issues=[];let exact=0,aliases=0,duplicateRows=0;
+        for(const [key,item] of grouped){
+          const targetKey=IMPORT_ALIASES.get(key)||key;const matches=peopleByName.get(targetKey)||[];
+          const override=IMPORT_SIZE_OVERRIDES.get(targetKey);const sizes=override?[override]:[...item.sizes];
+          const allSizesValid=item.rows.every(x=>SIZES.includes(x.size));
+          if(matches.length!==1){issues.push({name:item.rawName,reason:matches.length?'Nome duplicado na base':'Não encontrado na base'});continue}
+          if(!allSizesValid||sizes.length!==1){issues.push({name:item.rawName,reason:!allSizesValid?'Tamanho inválido ou vazio':'Respostas com tamanhos divergentes'});continue}
+          const target=matches[0];plan.push({id:target.id,nome:target.nome,operacao:target.operacao,tamanho:sizes[0],previous:target.tamanho,rows:item.rows.length});
+          if(IMPORT_ALIASES.has(key))aliases++;else exact++;
+          if(item.rows.length>1)duplicateRows+=item.rows.length-1;
+        }
+        importPlan=plan;importFileName=file.name;
+        const unchanged=plan.filter(x=>x.previous===x.tamanho).length;const changes=plan.length-unchanged;
+        $('importSummary').innerHTML=`<strong>${plan.length} colaboradores prontos para atualizar</strong> · ${changes} alterações de tamanho · ${unchanged} já estavam iguais.<br>${exact} correspondências pelo nome + ${aliases} nomes corrigidos/confirmados. ${duplicateRows} respostas repetidas consolidadas.<br><strong>${issues.length} respostas ficaram de fora</strong> por não terem correspondência única ou tamanho confiável.`;
+        const preview=[...plan.map(x=>({name:x.nome,detail:`${x.operacao} · ${x.previous||'Pendente'} → ${x.tamanho}`,ok:true})),...issues.map(x=>({name:x.name,detail:x.reason,ok:false}))];
+        $('importDetails').innerHTML=`<table class="people" style="min-width:0;margin:0"><thead><tr><th>Nome informado</th><th>Resultado</th></tr></thead><tbody>${preview.map(x=>`<tr><td>${escapeHtml(x.name)}</td><td style="color:${x.ok?'#25834a':'#bd3c36'}">${escapeHtml(x.detail)}</td></tr>`).join('')}</tbody></table>`;$('importDetails').classList.remove('hidden');
+        $('confirmImport').disabled=plan.length===0;setStatus('importStatus',plan.length?'Confira a prévia antes de confirmar.':'Nenhuma atualização segura encontrada.',plan.length?'success':'error');
+      }catch(err){importPlan=[];$('importSummary').textContent='';$('importDetails').classList.add('hidden');setStatus('importStatus',err.message||'Não foi possível ler o arquivo.','error')}
+    }
+    async function confirmImport(){
+      const changes=importPlan.filter(x=>x.previous!==x.tamanho);if(!changes.length){notify('Não há tamanhos novos para atualizar.');return}
+      if(!confirm(`Atualizar o tamanho de ${changes.length} colaboradores já cadastrados? Nenhum nome ou operação será alterado.`))return;
+      const btn=$('confirmImport');setBusy(btn,true,'Importando…');btn.disabled=true;let done=0;const failures=[];
+      for(let i=0;i<changes.length;i+=8){const chunk=changes.slice(i,i+8);const results=await Promise.all(chunk.map(async item=>{const {data,error}=await db.from(TABLE).update({tamanho:item.tamanho,updated_at:new Date().toISOString()}).eq('id',item.id).select('id,nome,operacao,tamanho,created_at,updated_at').single();return {item,data,error}}));
+        for(const result of results){if(result.error)failures.push(`${result.item.nome}: ${result.error.message}`);else{people=people.map(p=>String(p.id)===String(result.data.id)?result.data:p);done++}}
+      }
+      setBusy(btn,false);btn.disabled=false;renderHome();if(activeOperation)renderList();
+      if(failures.length){setStatus('importStatus',`${done} atualizados; ${failures.length} falharam. ${failures.slice(0,2).join(' | ')}`,'error');notify('Importação concluída parcialmente.',true)}else{setStatus('importStatus',`${done} tamanhos atualizados com sucesso.`,'success');notify(`${done} tamanhos importados!`);setTimeout(closeImport,900)}
+    }
+
     $('backHome').addEventListener('click',()=>{activeOperation=null;$('listView').classList.add('hidden');$('homeView').classList.remove('hidden');renderHome();window.scrollTo({top:0,behavior:'smooth'})});
     $('searchInput').addEventListener('input',renderList);
     $('addHome').addEventListener('click',()=>openPersonModal());$('addInOperation').addEventListener('click',()=>openPersonModal());
     $('exportHome').addEventListener('click',()=>exportCsv(people,'HOST-controle-de-uniformes.csv'));
     $('exportOperation').addEventListener('click',()=>exportCsv(people.filter(p=>p.operacao===activeOperation),`HOST-uniformes-${activeOperation}.csv`));
+    $('importHome').addEventListener('click',openImport);$('closeImport').addEventListener('click',closeImport);$('cancelImport').addEventListener('click',closeImport);$('importBackdrop').addEventListener('click',e=>{if(e.target===$('importBackdrop'))closeImport()});$('importFile').addEventListener('change',e=>prepareImport(e.target.files[0]));$('confirmImport').addEventListener('click',confirmImport);
     $('personForm').addEventListener('submit',savePerson);$('closeModal').addEventListener('click',closeModal);$('cancelModal').addEventListener('click',closeModal);
     $('modalBackdrop').addEventListener('click',e=>{if(e.target===$('modalBackdrop'))closeModal()});document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!$('modalBackdrop').classList.contains('hidden'))closeModal()});
     // Atualização em tempo real: alterações feitas por outra pessoa aparecem sem recarregar a página.
